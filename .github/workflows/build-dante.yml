@@ -1,0 +1,137 @@
+name: build-dante
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  # ── 1. 构建：matrix 覆盖 Debian 12 / 13，ABI 与目标机完全一致 ──
+  build:
+    strategy:
+      matrix:
+        include:
+          - distro: debian12
+            image: debian:bookworm-slim
+          - distro: debian13
+            image: debian:trixie-slim
+
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      - name: Install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential wget ca-certificates tar file binutils
+
+      - name: Download & verify Dante source
+        run: |
+          wget -q https://www.inet.no/dante/files/dante-1.4.4.tar.gz
+          echo "1973c7732f1f9f0a4c0ccf2c1ce462c7c25060b25643ea90f9b98f53a813faec  dante-1.4.4.tar.gz" \
+            | sha256sum -c -
+          tar -xzf dante-1.4.4.tar.gz
+
+      - name: Build Dante
+        run: |
+          cd dante-1.4.4
+          ./configure --prefix=/usr --sysconfdir=/etc
+          make -j"$(nproc)"
+
+      - name: Assemble package
+        run: |
+          mkdir -p out/usr/sbin
+          mkdir -p out/usr/lib/systemd/system
+
+          cp dante-1.4.4/sockd/sockd out/usr/sbin/
+
+          printf '%s\n' \
+            '[Unit]' \
+            'Description=SOCKS (v4 and v5) proxy daemon (Dante)' \
+            'Documentation=man:sockd(8)' \
+            'After=network-online.target tailscaled.service' \
+            'Wants=network-online.target' \
+            '' \
+            '[Service]' \
+            'Type=simple' \
+            'ExecStart=/usr/sbin/sockd -f /etc/danted.conf' \
+            'ExecReload=/bin/kill -HUP $MAINPID' \
+            'Restart=on-failure' \
+            'RestartSec=2' \
+            '' \
+            '[Install]' \
+            'WantedBy=multi-user.target' \
+            > out/usr/lib/systemd/system/danted.service
+
+      - name: Smoke test
+        run: |
+          file out/usr/sbin/sockd
+          file out/usr/sbin/sockd | grep -q "ELF 64-bit" \
+            || { echo "ERROR: 非 64-bit ELF"; exit 1; }
+
+          ldd out/usr/sbin/sockd
+          if ldd out/usr/sbin/sockd | grep -q "not found"; then
+            echo "ERROR: 存在无法解析的动态库依赖"; exit 1
+          fi
+
+          out/usr/sbin/sockd -v 2>&1 | grep -q "." \
+            || { echo "ERROR: sockd -v 无输出"; exit 1; }
+
+          grep -q "ExecStart=/usr/sbin/sockd" out/usr/lib/systemd/system/danted.service \
+            || { echo "ERROR: service ExecStart 路径与产物不符"; exit 1; }
+
+          echo "Smoke test passed ✓"
+
+      - name: Pack tarball
+        run: |
+          _name="dante-binary-${{ matrix.distro }}-amd64.tar.gz"
+          tar -C out -czf "${_name}" .
+          sha256sum "${_name}" > "${_name}.sha256"
+          cat "${_name}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dante-binary-${{ matrix.distro }}-amd64
+          path: |
+            dante-binary-${{ matrix.distro }}-amd64.tar.gz
+            dante-binary-${{ matrix.distro }}-amd64.tar.gz.sha256
+          retention-days: 7
+
+  # ── 2. 发布：等两个 build job 完成后，统一发 Release ───────────
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Publish GitHub Release (no-downtime update)
+        run: |
+          gh release create latest-build \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Dante 1.4.4 prebuilt (linux/amd64)" \
+            --notes "Matrix build: debian12 (bookworm) + debian13 (trixie). Consumed by \`modules/dante.sh\`." \
+            2>/dev/null || true
+
+          gh release upload latest-build \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            artifacts/dante-binary-debian12-amd64.tar.gz \
+            artifacts/dante-binary-debian12-amd64.tar.gz.sha256 \
+            artifacts/dante-binary-debian13-amd64.tar.gz \
+            artifacts/dante-binary-debian13-amd64.tar.gz.sha256
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
